@@ -57,15 +57,20 @@ repository does not require it and stores nothing outside your own database.
 ## Architecture
 
 ```
-        Cloudflare Cron (every 5 min)
+        Cloudflare Cron (every 5 min, and every 4 h)
                  |
+                 | 5-min tick: poller enqueues due sources
+                 | 4-h tick:   scanner (if enabled) enqueues X signals
                  v
         +-----------------+     one message     +-----------------------+
         |   runPoller     | ------------------> |  Queue: gtm-ingest-   |
         |  (enqueue only) |    per due source   |  jobs  (+ DLQ)        |
         +-----------------+                     +-----------+-----------+
-                                                            |
-                                                            v
+                                                             |
+        +-----------------+   ingest-signal messages          |
+        |  runScanner     | --------------------  ------------+
+        |  (Grok X scan)  |                                  |
+        +-----------------+                                  v
                                     +-------------------------------------------+
                                     |  Consumer: fetch -> normalize -> dedup -> |
                                     |  insert into Neon                         |
@@ -99,6 +104,11 @@ parsing, and writing happens in the queue consumer, so the fast trigger path sta
 fast and each source retries independently. Classification runs on its own queue so
 LLM latency or cost can never affect ingestion.
 
+A second, four-hourly cron runs the **Grok X scanner**: it asks a model for new X
+signals, validates them, and enqueues them as `ingest-signal` messages on the *same*
+ingest queue. They therefore flow through the identical normalize → dedup → `items`
+→ classify path as every other source. The scanner has no separate database path.
+
 ### Layout
 
 | Path | Purpose |
@@ -116,6 +126,8 @@ LLM latency or cost can never affect ingestion.
 | `src/classify/*` | batched classification: handler, prompt, schema, config, policy |
 | `src/entities/*` | alias map (entity resolution) + cross-source clustering |
 | `src/inco/client.ts` | OpenAI-compatible chat client |
+| `src/queue.ts` | queue message construction + UTF-8 byte-budget chunking (shared by `/signals` and the scanner) |
+| `src/scan/*` | Grok X scanner: config, prompt, zod schema, mapping, orchestration |
 | `migrations/*.sql` | schema, applied in filename order |
 | `scripts/migrate.mjs` | apply migrations to Neon over HTTP |
 | `scripts/smoke.ts` | pure-logic tests (no network/DB) |
@@ -223,6 +235,49 @@ keeps running; no `classify-batch` messages are produced and no model is called.
 Non-secret vars live in `wrangler.toml` under `[vars]`; the model ids were verified
 against `GET https://api.inco.ai/v1/models` on 2026-10-07.
 
+### Grok X scanner
+
+The scanner asks an X-data-savvy model, on a **four-hourly** Cloudflare Cron Trigger
+(`0 */4 * * *`), for new signals about the AI developer tools you track. It uses the
+same OpenAI-compatible client as the classifier and pushes results through the
+existing ingest seam: validated signals are enqueued as `ingest-signal` messages and
+then normalized, deduplicated, written to `items`, and classified exactly like every
+other source. **There is no separate database.** It is **off by default**.
+
+Enable it:
+
+1. Set a real scanner model id in `wrangler.toml` under `[vars]` (or as a Worker
+   secret): `INCO_SCANNER_MODEL = "<your-x-scanning-model-id>"`. The default is a
+   placeholder, and the scanner **refuses to run** while it is unset — so it never
+   spends on the wrong capability.
+2. Set `SCANNER_ENABLED = "true"`.
+3. Ensure `INCO_API_KEY` is set (the scanner shares the classifier's key).
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `SCANNER_ENABLED` | `"false"` | Kill switch. `"true"` enables the four-hourly scan. |
+| `INCO_SCANNER_MODEL` | placeholder | The X-scanning model id. **Must be set** to run. |
+| `SCANNER_TRACKED_ENTITIES` | a default list | Comma-separated competitors/products (also your own product). Edit to watch a new competitor — no code change. |
+| `SCANNER_TRACKED_KEYWORDS` | a default list | Comma-separated themes to watch for. |
+| `SCANNER_MAX_ITEMS_PER_SCAN` | `25` | Hard cap on signals enqueued per scan (cost guardrail). |
+
+The tracked lists also have editable defaults in `src/scan/config.ts`. The scanner
+registers a source (`grok-x-scanner`) in `src/registry/seed.ts`; it is `enabled:false`
+so the normal poller never GETs it, but it exists so the `/signals` seam and
+classification attribution accept its rows.
+
+**Schedule.** The four-hourly trigger lives in `wrangler.toml` under `[triggers]`.
+The Worker has one `scheduled` handler that dispatches on `event.cron`: the frequent
+tick runs the poller, the four-hourly tick runs `runScanner`.
+
+**Idempotency & cost.** Repeated scans do not spam duplicates: signals are de-duped
+in-batch and against a bounded rolling set of stable keys (URL-canonical when present,
+else normalized title) persisted in the `meta` table — on top of the database's own
+`(source_id, canonical_url)` / `(source_id, title_hash)` dedup. Each scan logs one
+structured audit line (`event: "scan.complete"`) with `scanned`, `enqueued`, and
+`rejected` counts, plus token usage. The API key is read only from `env.INCO_API_KEY`
+and never logged.
+
 ### Manual triggers
 
 Poll a single source on demand:
@@ -278,12 +333,12 @@ auditable and reproducible, and entity identity never depends on a model's judgm
 
 Planned work, clearly separated from what already ships:
 
-- **Grok X scanner (planned).** A scanner that polls X (via Grok) on a four-hour
-  cycle and pushes signals through the existing ingest path. The pipeline already has
-  the seam for it: `POST /signals/:sourceId` accepts an array of signals and runs them
-  through the same normalizer, dedup, and `items` table. The scanner itself is not
-  built yet; the `/signals` endpoint only works for a source that is already seeded in
-  the registry.
+- **Grok X scanner (shipped).** A four-hourly scan of X (via Grok) that pushes
+  signals through the existing ingest path. Enable it with `SCANNER_ENABLED = "true"`
+  and a real `INCO_SCANNER_MODEL`; edit `SCANNER_TRACKED_ENTITIES` to change what it
+  watches. It reuses the `ingest-signal` seam, the normalizer, the same `items` table,
+  and the classify queue — no separate database. See "Grok X scanner" above. The
+  `POST /signals/:sourceId` endpoint remains available for manual pushes.
 - **Human-in-the-loop earned-media drafting agent (planned).** A drafting agent that
   uses Cloudflare's Agents SDK to turn strong signals into draft posts for review.
   It is designed to be **human-in-the-loop and disclosed**: a draft is produced, a

@@ -2,11 +2,24 @@ import { handleQueue, pollSource } from "./consumer";
 import { runPoller, selectDueSources } from "./poller";
 import { findSource, getSources } from "./registry";
 import { loadSourceStates, syncSources } from "./db";
+import { SCANNER_CRON } from "./scan/config";
+import { runScanner } from "./scan/grok-x";
+import { MAX_MESSAGE_BYTES, chunkSignals, messageBytes } from "./queue";
 import type { Env, QueueMessage, RawSignal } from "./types";
 
 export default {
-  /** Cron trigger: enqueue only. */
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  /**
+   * Cron trigger: enqueue only. The Worker has ONE `scheduled` handler for every
+   * declared cron, so it dispatches on `event.cron`:
+   *   - the frequent poller tick enqueues due sources;
+   *   - the four-hourly scanner tick runs the Grok X scan.
+   * Both are "enqueue/write small" paths; heavy work lives in the consumers.
+   */
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (event.cron === SCANNER_CRON) {
+      ctx.waitUntil(runScanner(env));
+      return;
+    }
     ctx.waitUntil(runPoller(env));
   },
 
@@ -82,18 +95,6 @@ async function manualTrigger(env: Env, sourceId: string, request: Request): Prom
 
 /** Max signals accepted in a single POST. Bounds work and payload size. */
 const MAX_SIGNALS_PER_REQUEST = 50;
-/**
- * Conservative message-size budget, below the 128 KB queue limit. Measured in
- * UTF-8 BYTES, not string length: Queues enforce a byte limit and non-ASCII
- * content (emoji, CJK, curly quotes) is 2–4x its UTF-16 code-unit count, so a
- * `.length` guard lets an oversized message through to a runtime rejection.
- */
-const MAX_MESSAGE_BYTES = 110 * 1024;
-
-/** UTF-8 byte size of a message once serialized for the queue. */
-function messageBytes(message: QueueMessage): number {
-  return new TextEncoder().encode(JSON.stringify(message)).byteLength;
-}
 
 /**
  * Parse one untrusted payload element into a trusted `RawSignal`, or reject it.
@@ -122,57 +123,6 @@ function parseSignal(raw: unknown): RawSignal | null {
     ...(rawContent !== undefined ? { rawContent } : {}),
     ...(signalTags !== undefined ? { signalTags } : {}),
   };
-}
-
-function signalMessage(
-  sourceId: string,
-  enqueuedAt: string,
-  items: ReadonlyArray<RawSignal>,
-): QueueMessage {
-  return { kind: "ingest-signal", sourceId, enqueuedAt, items };
-}
-
-/**
- * Greedily chunk signals so each enqueued message stays under the byte budget.
- * A single signal too large to fit in one message is dropped (never enqueued
- * oversized) and reported via `droppedOversized` so the caller can count it.
- */
-function chunkSignals(
-  sourceId: string,
-  enqueuedAt: string,
-  signals: ReadonlyArray<RawSignal>,
-): { readonly messages: ReadonlyArray<QueueMessage>; readonly droppedOversized: number } {
-  const messages: QueueMessage[] = [];
-  let chunk: RawSignal[] = [];
-  let droppedOversized = 0;
-  for (const signal of signals) {
-    if (messageBytes(signalMessage(sourceId, enqueuedAt, [signal])) > MAX_MESSAGE_BYTES) {
-      droppedOversized += 1;
-      console.error(
-        JSON.stringify({
-          event: "signals.dropped_oversized",
-          sourceId,
-          title: signal.title,
-          url: signal.url,
-          budgetBytes: MAX_MESSAGE_BYTES,
-        }),
-      );
-      continue;
-    }
-    if (
-      chunk.length > 0 &&
-      messageBytes(signalMessage(sourceId, enqueuedAt, [...chunk, signal])) > MAX_MESSAGE_BYTES
-    ) {
-      messages.push(signalMessage(sourceId, enqueuedAt, chunk));
-      chunk = [signal];
-    } else {
-      chunk = [...chunk, signal];
-    }
-  }
-  if (chunk.length > 0) {
-    messages.push(signalMessage(sourceId, enqueuedAt, chunk));
-  }
-  return { messages, droppedOversized };
 }
 
 /**
@@ -240,7 +190,7 @@ async function manualSignals(env: Env, sourceId: string, request: Request): Prom
 
 // Re-exported for scripts/tests and to keep the module graph explicit.
 export { runPoller, selectDueSources, syncSources, loadSourceStates };
-export { chunkSignals, messageBytes, MAX_MESSAGE_BYTES };
+export { chunkSignals, messageBytes, MAX_MESSAGE_BYTES, signalMessage } from "./queue";
 // Signal-layer pure logic, re-exported for `scripts/smoke.ts` (no network/DB).
 export { parseClassificationResponse, SIGNAL_LABELS } from "./classify/schema";
 export { chunkItems, reconcile, missingIndices, isValidRepairIndexSet, unclassified } from "./classify/batch";
@@ -254,3 +204,15 @@ export { shouldWriteClassification, shouldLoadForClassification } from "./classi
 export { classifyOneBatch } from "./classify/handler";
 export { canonicalizeEntity, canonicalizeEntities, normalizeMention } from "./entities/aliases";
 export { clusterByGlobalTitleHash, currentClusterMemberIds, clusterLifecycle } from "./entities/cluster";
+// Grok X-scanner pure logic, re-exported for `scripts/smoke.ts` (no network/DB).
+export {
+  getScannerConfig,
+  DEFAULT_SCANNER_MODEL,
+  DEFAULT_TRACKED_ENTITIES,
+  SCANNER_CRON,
+  SCANNER_SOURCE_ID,
+} from "./scan/config";
+export { parseScannerResponse } from "./scan/schema";
+export { mapScannerSignal, scannerDedupKey, selectNewSignals } from "./scan/map";
+export { buildScannerPrompt, SCANNER_PROMPT_VERSION } from "./scan/prompt";
+export { runScanner } from "./scan/grok-x";

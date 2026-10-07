@@ -29,6 +29,16 @@ import {
   shouldWriteClassification,
   shouldLoadForClassification,
   isValidRepairIndexSet,
+  getScannerConfig,
+  DEFAULT_SCANNER_MODEL,
+  DEFAULT_TRACKED_ENTITIES,
+  SCANNER_SOURCE_ID,
+  parseScannerResponse,
+  mapScannerSignal,
+  scannerDedupKey,
+  selectNewSignals,
+  buildScannerPrompt,
+  runScanner,
 } from "../src/index.ts";
 import type { IncoClient } from "../src/inco/client.ts";
 import type { ClassificationItem } from "../src/classify/schema.ts";
@@ -728,6 +738,273 @@ check("parses atom entry", parseFeed(atom)[0]?.url === "https://example.com/e");
   );
   check("M2: still-corroborated clusters stay active", stable.activeKeys.join(",") === "HA,HB");
   check("M2: stable clusters are not deactivated", stable.deactivatedKeys.length === 0);
+}
+
+// ===========================================================================
+// Grok X scanner. Pure logic + a mocked, network-free `runScanner`.
+// ===========================================================================
+
+// --- Scanner config parsing (kill switch + placeholder model) --------------
+{
+  const off = getScannerConfig({} as Env);
+  check("scanner: disabled by default", off.enabled === false);
+  check("scanner: default model is the placeholder", off.model === DEFAULT_SCANNER_MODEL);
+  check("scanner: placeholder is reported unconfigured", off.modelConfigured === false);
+  check("scanner: default tracked entities are non-empty", off.trackedEntities.length > 0);
+  check("scanner: default cap is positive", off.maxItemsPerScan > 0);
+
+  const on = getScannerConfig({
+    SCANNER_ENABLED: "TRUE",
+    INCO_SCANNER_MODEL: "grok-x-scan-v1",
+    SCANNER_TRACKED_ENTITIES: "Acme AI, , Foo",
+    SCANNER_MAX_ITEMS_PER_SCAN: "7",
+  } as Env);
+  check("scanner: SCANNER_ENABLED=TRUE turns it on", on.enabled === true);
+  check("scanner: a real model is reported configured", on.modelConfigured === true);
+  check(
+    "scanner: tracked entities parse + drop blanks",
+    on.trackedEntities.join("|") === "Acme AI|Foo",
+  );
+  check("scanner: cap parsed", on.maxItemsPerScan === 7);
+
+  const emptyCsv = getScannerConfig({ SCANNER_TRACKED_ENTITIES: "  ,  " } as Env);
+  check(
+    "scanner: empty entity CSV falls back to defaults",
+    emptyCsv.trackedEntities.length === DEFAULT_TRACKED_ENTITIES.length,
+  );
+
+  const badCap = getScannerConfig({ SCANNER_MAX_ITEMS_PER_SCAN: "-3" } as Env);
+  check("scanner: non-positive cap falls back to default", badCap.maxItemsPerScan > 0);
+}
+
+// --- Untrusted LLM output validation ---------------------------------------
+{
+  check(
+    "scanner schema: accepts a bare JSON array",
+    parseScannerResponse(
+      '[{"title":"Cursor ships X","url":"https://x.com/a/status/1","author":"dev","summary":"new"}]',
+    ).ok === true,
+  );
+  check(
+    "scanner schema: accepts { signals: [...] } wrapper",
+    parseScannerResponse('{"signals":[{"title":"Foo launch"}]}').ok === true,
+  );
+  check(
+    "scanner schema: strips ```json fences",
+    parseScannerResponse('```json\n[{"title":"Fenced"}]\n```').ok === true,
+  );
+  check("scanner schema: rejects malformed JSON", parseScannerResponse("not json").ok === false);
+  check(
+    "scanner schema: rejects a non-array/non-signals shape",
+    parseScannerResponse('{"items":[{"title":"x"}]}').ok === false,
+  );
+  check(
+    "scanner schema: rejects an empty title (drop rule)",
+    parseScannerResponse('[{"title":"   "}]').ok === false,
+  );
+  check(
+    "scanner schema: rejects a non-string title",
+    parseScannerResponse('[{"title":42}]').ok === false,
+  );
+  check(
+    "scanner schema: rejects a non-URL url",
+    parseScannerResponse('[{"title":"ok","url":"not a url"}]').ok === false,
+  );
+  check("scanner schema: empty response is rejected", parseScannerResponse("  ").ok === false);
+
+  // A reply that parses but is empty is a VALID empty result, not a failure.
+  const empty = parseScannerResponse('{"signals":[]}');
+  check("scanner schema: empty array is a valid empty result", empty.ok === true && empty.signals.length === 0);
+}
+
+// --- Signal mapping + stable dedup key -------------------------------------
+{
+  const mapped = mapScannerSignal({
+    title: "Cursor launches a new agent",
+    url: "https://x.com/cursor/status/1?utm_source=app",
+    author: "@cursor",
+    publishedAt: "2026-10-07T10:00:00Z",
+    summary: "A new agent mode.",
+    tags: ["Cursor", "cursor", " ", "AI agent"],
+  });
+  check("map: title/url preserved", mapped.signal.title === "Cursor launches a new agent" && mapped.signal.url !== "");
+  check("map: author + publishedAt preserved", mapped.signal.author === "@cursor" && mapped.signal.publishedAt === "2026-10-07T10:00:00Z");
+  check("map: summary preserved", mapped.signal.summary === "A new agent mode.");
+  check("map: rawContent falls back to summary", mapped.signal.rawContent === "A new agent mode.");
+  check("map: tags de-duped case-insensitively, blanks dropped", mapped.signal.signalTags?.length === 2);
+  check("map: dedupKey uses canonical url", mapped.dedupKey.startsWith("url:"));
+
+  // Tracking params are stripped, so two permalink variants share ONE key.
+  check(
+    "map: dedupKey collapses utm variants",
+    scannerDedupKey({ title: "a", url: "https://x.com/a/1?utm_source=x" }) ===
+      scannerDedupKey({ title: "b", url: "https://x.com/a/1" }),
+  );
+  // URL-less signals fall back to a normalized-title key.
+  const noUrl = mapScannerSignal({ title: "Foo!!   Launch" });
+  check("map: URL-less signal keys on normalized title", noUrl.dedupKey === "title:foo launch");
+  check("map: URL-less rawContent falls back to title", noUrl.signal.rawContent === "Foo!!   Launch");
+  check(
+    "map: different titles produce different keys",
+    scannerDedupKey({ title: "one" }) !== scannerDedupKey({ title: "two" }),
+  );
+}
+
+// --- Per-scan cap + dedup (selectNewSignals) -------------------------------
+{
+  const signals = [
+    { title: "A", url: "https://x.com/a" },
+    { title: "B", url: "https://x.com/b" },
+    { title: "A again", url: "https://x.com/a" }, // duplicate url within batch
+    { title: "C", url: "https://x.com/c" },
+    { title: "D", url: "https://x.com/d" },
+  ];
+  const sel = selectNewSignals(signals, new Set(), 3);
+  check("select: in-batch duplicate dropped", sel.mapped.length === 3);
+  check("select: cap respected", sel.mapped.map((m) => m.signal.title).join(",") === "A,B,C");
+  check("select: skipped accounts for dup + over-cap", sel.skipped === 2);
+
+  const seen = new Set(["url:https://x.com/a"]);
+  const deduped = selectNewSignals(signals, seen, 10);
+  check("select: seen-key suppresses a repeat across scans", !deduped.mapped.some((m) => m.signal.title === "A"));
+
+  check("select: empty input yields nothing", selectNewSignals([], new Set(), 10).mapped.length === 0);
+}
+
+// --- Prompt builds with tracked entities -----------------------------------
+{
+  const config = getScannerConfig({ INCO_SCANNER_MODEL: "grok-x-scan-v1" } as Env);
+  const prompt = buildScannerPrompt(config);
+  check("prompt: user turn lists tracked entities", prompt.user.includes("Cursor"));
+  check("prompt: system turn states the JSON contract", prompt.system.includes("signals"));
+  check("prompt: cap is echoed in the user turn", prompt.user.includes(String(config.maxItemsPerScan)));
+}
+
+// --- runScanner with a mock client (no network, no real key) ---------------
+{
+  const baseEnv = {
+    SCANNER_ENABLED: "true",
+    INCO_SCANNER_MODEL: "grok-x-scan-v1",
+    INCO_API_KEY: "test-key-not-real",
+  } as unknown as Env;
+
+  const makeClient = (reply: string): { client: IncoClient; calls: () => number } => {
+    let n = 0;
+    return {
+      client: {
+        async chat() {
+          n += 1;
+          return {
+            content: reply,
+            model: "grok-x-scan-v1",
+            usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
+            status: 200,
+          };
+        },
+      },
+      calls: () => n,
+    };
+  };
+
+  // (a) Disabled => no client call at all.
+  {
+    const mock = makeClient("[]");
+    const enqueued: unknown[] = [];
+    const outcome = await runScanner({ SCANNER_ENABLED: "false" } as Env, {
+      makeClient: () => mock.client,
+      enqueue: async (_e, msgs) => { enqueued.push(...msgs); },
+    });
+    check("runner: disabled => skipped-disabled", outcome.status === "skipped-disabled");
+    check("runner: disabled => no LLM call", mock.calls() === 0);
+    check("runner: disabled => nothing enqueued", enqueued.length === 0);
+  }
+
+  // (b) Enabled but model still the placeholder => skip without a call.
+  {
+    const mock = makeClient("[]");
+    const outcome = await runScanner({ SCANNER_ENABLED: "true", INCO_API_KEY: "k" } as Env, {
+      makeClient: () => mock.client,
+    });
+    check("runner: placeholder model => skipped-unconfigured", outcome.status === "skipped-unconfigured");
+    check("runner: placeholder model => no LLM call", mock.calls() === 0);
+  }
+
+  // (c) Enabled + configured, happy path: validates, maps, enqueues, persists.
+  {
+    const mock = makeClient(
+      '[{"title":"Cursor ships agent mode","url":"https://x.com/cursor/status/9","summary":"new feature","tags":["Cursor"]}]',
+    );
+    const enqueued: QueueMessage[] = [];
+    let saved: ReadonlyArray<string> | null = null;
+    const outcome = await runScanner(baseEnv, {
+      makeClient: () => mock.client,
+      loadSeen: async () => new Set(),
+      saveSeen: async (_e, keys) => { saved = keys; },
+      enqueue: async (_e, msgs) => { enqueued.push(...msgs); },
+    });
+    check("runner: happy path status scanned", outcome.status === "scanned");
+    check("runner: one LLM call", mock.calls() === 1);
+    check("runner: scanned count is 1", outcome.scanned === 1);
+    check("runner: enqueued count is 1", outcome.enqueued === 1);
+    check("runner: exactly one ingest-signal message", enqueued.length === 1 && enqueued[0]?.kind === "ingest-signal");
+    check(
+      "runner: message targets the scanner source",
+      enqueued[0]?.kind === "ingest-signal" && enqueued[0].sourceId === SCANNER_SOURCE_ID,
+    );
+    check("runner: seen keys persisted (non-null)", saved !== null && (saved as ReadonlyArray<string>).length === 1);
+  }
+
+  // (d) Parse failure => error, nothing enqueued.
+  {
+    const mock = makeClient("definitely not json");
+    const enqueued: unknown[] = [];
+    const outcome = await runScanner(baseEnv, {
+      makeClient: () => mock.client,
+      loadSeen: async () => new Set(),
+      saveSeen: async () => {},
+      enqueue: async (_e, msgs) => { enqueued.push(...msgs); },
+    });
+    check("runner: unparseable output => error", outcome.status === "error");
+    check("runner: unparseable output => nothing enqueued", enqueued.length === 0);
+  }
+
+  // (e) Duplicate of a previously-seen key => empty, nothing enqueued.
+  {
+    const mock = makeClient('[{"title":"Repeat","url":"https://x.com/repeat/1"}]');
+    const enqueued: unknown[] = [];
+    const seenKey = scannerDedupKey({ title: "Repeat", url: "https://x.com/repeat/1" });
+    const outcome = await runScanner(baseEnv, {
+      makeClient: () => mock.client,
+      loadSeen: async () => new Set([seenKey]),
+      saveSeen: async () => {},
+      enqueue: async (_e, msgs) => { enqueued.push(...msgs); },
+    });
+    check("runner: duplicate-of-seen => empty", outcome.status === "empty");
+    check("runner: duplicate-of-seen => nothing enqueued", enqueued.length === 0);
+  }
+
+  // (f) Client throws => error, never propagates.
+  {
+    const outcome = await runScanner(baseEnv, {
+      makeClient: () => ({ chat: async () => { throw new Error("network down"); } }),
+      loadSeen: async () => new Set(),
+      saveSeen: async () => {},
+      enqueue: async () => {},
+    });
+    check("runner: client fault is swallowed as error", outcome.status === "error");
+  }
+
+  // (g) Registry guard: if the scanner source is missing, refuse to enqueue.
+  //     (Verified indirectly: the seeded registry DOES contain it, so a real
+  //     scan proceeds — see the happy-path case above.)
+  check(
+    "registry: scanner source is seeded (so /signals accepts it)",
+    sources.some((s) => s.id === SCANNER_SOURCE_ID),
+  );
+  check(
+    "registry: scanner source is not polled (enabled false)",
+    sources.find((s) => s.id === SCANNER_SOURCE_ID)?.enabled === false,
+  );
 }
 
 if (failures > 0) {

@@ -191,4 +191,19 @@ export interface Env {
   readonly CLASSIFIER_MAX_ITEMS_PER_MESSAGE?: string;
   /** Max concurrent in-flight LLM calls within one message. */
   readonly CLASSIFIER_MAX_CONCURRENCY?: string;
+
+  // --- Signal layer (Grok X scanner) ---------------------------------------
+  /** Kill switch. "true" enables the 4-hourly scan; anything else (or absent) is off. */
+  readonly SCANNER_ENABLED?: string;
+  /**
+   * Scanner model id (the X-scanning model). Defaults to an unusable placeholder
+   * in `src/scan/config.ts`; the scanner refuses to run until it is set.
+   */
+  readonly INCO_SCANNER_MODEL?: string;
+  /** Comma-separated tracked entities/products. Defaults in `src/scan/config.ts`. */
+  readonly SCANNER_TRACKED_ENTITIES?: string;
+  /** Comma-separated tracked keywords/themes. Defaults in `src/scan/config.ts`. */
+  readonly SCANNER_TRACKED_KEYWORDS?: string;
+  /** Hard cap on signals enqueued per scan (cost guardrail). */
+  readonly SCANNER_MAX_ITEMS_PER_SCAN?: string;
 }
