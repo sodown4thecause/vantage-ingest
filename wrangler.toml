@@ -15,9 +15,12 @@ main = "src/index.ts"
 compatibility_date = "2024-09-09"
 compatibility_flags = ["nodejs_compat"]
 
-# Only the cron wake-up. It does NOT fetch sources inline; it only enqueues.
+# Cron wakes. Neither fetches sources inline; each only enqueues/writes.
+#   - every 5 min: the poller decides which sources are actually due.
+#   - every 4 hours: the Grok X scanner runs one scan (gated by SCANNER_ENABLED).
+# The Worker has a single `scheduled` handler that dispatches on `event.cron`.
 [triggers]
-crons = ["*/5 * * * *"] # every 5 min: poller decides which sources are actually due
+crons = ["*/5 * * * *", "0 */4 * * *"]
 
 [[queues.producers]]
 binding = "INGEST_QUEUE"
@@ -65,3 +68,15 @@ INCO_WRITER_MODEL = "kimi-k3"
 CLASSIFIER_BATCH_SIZE = "15"
 CLASSIFIER_MAX_ITEMS_PER_MESSAGE = "60"
 CLASSIFIER_MAX_CONCURRENCY = "2"
+# --- Grok X scanner (signal layer; OFF until enabled) ----------------------
+# Master switch. Set SCANNER_ENABLED = "true" (and INCO_SCANNER_MODEL below) to
+# turn on the 4-hourly scan. Default "false" so it never runs unconfigured.
+SCANNER_ENABLED = "false"
+# The X-scanning Grok model id. PLACEHOLDER: set the real id to enable the scan
+# (the scanner refuses to run while this stays the placeholder).
+INCO_SCANNER_MODEL = "replace-with-grok-x-scanner-model"
+# Comma-separated tracked entities/products and themes. Edit to watch new competitors.
+SCANNER_TRACKED_ENTITIES = "Cursor,GitHub Copilot,Claude Code,OpenAI Codex,Windsurf,Cline,Aider,Devin,Replit,Google Gemini,LangChain"
+SCANNER_TRACKED_KEYWORDS = "AI coding agent,AI code review,developer tool launch,funding round,new model release"
+# Hard cap on signals enqueued per scan (cost guardrail).
+SCANNER_MAX_ITEMS_PER_SCAN = "25"

@@ -87,6 +87,53 @@ export async function saveRegistryFingerprint(
   `;
 }
 
+/** `meta` key holding the scanner's recent-window dedup key set. */
+const SCANNER_SEEN_KEYS_META_KEY = "scanner_seen_keys";
+
+/**
+ * Load the scanner's recent-window dedup key set from the `meta` table.
+ *
+ * This is a small rolling SET of stable per-signal keys (see
+ * `scannerDedupKey`), NOT an item store: it exists only so back-to-back scans
+ * skip re-enqueuing the same post. It is bounded by the scanner when written, so
+ * this read stays cheap. A missing/corrupt value reads as an empty set (the
+ * scanner then falls back to the DB's own dedup), never as an error.
+ */
+export async function loadScannerSeenKeys(databaseUrl: string): Promise<ReadonlySet<string>> {
+  const db = sql(databaseUrl);
+  const rows = await db`
+    select value from meta where key = ${SCANNER_SEEN_KEYS_META_KEY}
+  `;
+  const raw = rows[0]?.value as string | undefined;
+  if (raw === undefined || raw === "") return new Set();
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((k): k is string => typeof k === "string"));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Persist the scanner's recent-window dedup key set. Best-effort by design:
+ * losing the window only costs a redundant enqueue (the DB dedup still applies),
+ * so a failed write must never fail a scan.
+ */
+export async function saveScannerSeenKeys(
+  databaseUrl: string,
+  keys: ReadonlyArray<string>,
+): Promise<void> {
+  const db = sql(databaseUrl);
+  // Store as JSON text; the column is `text not null`. De-dup defensively.
+  const payload = JSON.stringify([...new Set(keys)]);
+  await db`
+    insert into meta (key, value, updated_at)
+    values (${SCANNER_SEEN_KEYS_META_KEY}, ${payload}, now())
+    on conflict (key) do update set value = excluded.value, updated_at = excluded.updated_at
+  `;
+}
+
 /**
  * Upsert the registry into `sources` so the DB mirrors config. Idempotent;
  * never clobbers conditional-GET state (etag/lastModified/lastPolledAt).

@@ -342,4 +342,22 @@ export const SOURCE_REGISTRY: ReadonlyArray<SourceTemplate> = [
     rateLimit: RATE_EDGAR,
     expand: EDGAR_QUERIES.map((query) => ({ query })),
   },
+
+  // --- Signal layer: Grok-driven X scanner (push, not polled) -------------
+  // This source is NOT fetched by the normal poller. It exists so the scanner's
+  // `ingest-signal` messages pass the registry check and so classification /
+  // attribution have a real source row. `enabled: false` keeps the 5-minute
+  // poller from ever trying to GET it; the scanner writes through the queue seam
+  // and is gated by its own SCANNER_ENABLED switch (see src/scan/*).
+  {
+    id: "grok-x-scanner",
+    name: "Grok X scanner",
+    category: "community",
+    accessMethod: "api",
+    url: "https://x.com",
+    pollIntervalMinutes: 240,
+    signalType: "competitor-mention",
+    enabled: false,
+    note: "Pushed by the 4-hourly Grok X scanner (SCANNER_ENABLED). Not polled directly.",
+  },
 ];
