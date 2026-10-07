@@ -1,0 +1,24 @@
+{
+  "name": "vantage-earned-media",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Human-in-the-loop earned-media DRAFTING agent (isolated worker).",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx test/agent.test.ts",
+    "test": "tsx test/agent.test.ts"
+  },
+  "dependencies": {
+    "agents": "0.26.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.78.0"
+  }
+}

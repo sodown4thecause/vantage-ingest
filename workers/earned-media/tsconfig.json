@@ -1,0 +1,24 @@
+{
+  // The agent worker has its OWN dependency tree (agents@0.26.0 + zod@4) and must
+  // NOT be typechecked by the root project. The root `tsconfig.json` includes
+  // only `src/**/*.ts` and `scripts/**/*.ts`, so this directory is excluded by
+  // construction; this file is the boundary.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "allowImportingTsExtensions": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------------------
+# Cloudflare Workers config for the earned-media DRAFTING agent.
+#
+# This is a SEPARATE worker from the root ingest worker (`../../wrangler.toml`).
+# It is isolated on purpose: the Agents SDK (`agents@0.26.0`) requires zod@4,
+# while the ingest worker pins zod@3. Keeping the two package trees and configs
+# apart lets each worker pin what it needs without a peer-dependency override.
+#
+# It binds:
+#   - a Durable Object (the DraftingAgent review queue)
+#   - a Workflow (the human-in-the-loop draft -> review -> post run)
+#
+# Nothing here posts automatically. See README.md.
+# ---------------------------------------------------------------------------
+
+name = "vantage-earned-media"
+main = "src/index.ts"
+# `nodejs_compat` is required by the Agents SDK (it uses node:async_hooks).
+# Date must be >= 2024-09-23 so node builtins (e.g. `path`, pulled in
+# transitively via the SDK's `mimetext` dependency) resolve to `node:`.
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Durable Object binding for the drafting agent (the review queue + audit table).
+[durable_objects]
+bindings = [{ name = "DRAFTING_AGENT", class_name = "DraftingAgent" }]
+
+# Agents must be created as SQLite-backed classes; the `new_sqlite_classes`
+# migration is REQUIRED (the agent stores its review queue + audit table in
+# `this.sql`, which is backed by the DO's embedded SQLite).
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DraftingAgent"]
+
+# Durable Workflow binding. `class_name` must match the exported workflow class.
+[[workflows]]
+name = "earned-media-workflow"
+binding = "EARNED_MEDIA_WORKFLOW"
+class_name = "EarnedMediaWorkflow"
+
+# Secrets (set via `wrangler secret put`, never committed):
+#   INCO_API_KEY  - inference API key for the drafting writer model
+#
+# Non-secret vars
+[vars]
+# Writer model id. Verified against `GET https://api.inco.ai/v1/models`.
+INCO_WRITER_MODEL = "kimi-k3"
+# Disclosure is DEFAULT ON: set "false" to explicitly opt out (not recommended).
+DRAFT_DISCLOSURE_ENABLED = "true"
